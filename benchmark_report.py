@@ -78,8 +78,8 @@ plt.grid(True, alpha=0.3)
 plt.savefig('benchmark_histogram.png', dpi=300)
 print("Graph successfully generated and saved as 'benchmark_histogram.png'!")
 
-# Calculate the 20-day Exponential Moving Average
-df['EMA'] = df[('Close', 'SPY')].ewm(span=20, adjust=False).mean()
+# Change span from 20 to 14
+df['EMA'] = df[('Close', 'SPY')].ewm(span=14, adjust=False).mean()
 
 # 1. Get the daily price change
 df['Price_Change'] = df[('Close', 'SPY')].diff()
@@ -102,14 +102,14 @@ df.dropna(inplace=True)
 # Initialize a column of zeros (0 = Hold / Cash)
 df['Signal'] = 0
 
-# Apply the strict Entry Condition (BUY = 1)
-# Price must be above EMA AND RSI must be under 72
-buy_condition = (df[('Close', 'SPY')] > df['EMA']) & (df['RSI'] < 72)
+# Apply the updated, relaxed Entry Condition (BUY = 1)
+# We allow buying even if RSI is up to 80 now!
+buy_condition = (df[('Close', 'SPY')] > df['EMA']) & (df['RSI'] < 80)
 df.loc[buy_condition, 'Signal'] = 1
 
-# Apply the strict Exit Condition (SELL/STAY OUT = 0)
-# If price drops below EMA OR RSI overheats past 75, we exit to cash
-exit_condition = (df[('Close', 'SPY')] < df['EMA']) | (df['RSI'] > 75)
+# Apply the updated, relaxed Exit Condition (SELL = 0)
+# We hold onto the asset until RSI screams past 80!
+exit_condition = (df[('Close', 'SPY')] < df['EMA']) | (df['RSI'] > 80)
 df.loc[exit_condition, 'Signal'] = 0
 
 # 1. Shift signals by 1 day 
