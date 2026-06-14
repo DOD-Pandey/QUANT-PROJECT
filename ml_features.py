@@ -140,28 +140,34 @@ dt_preds = dt_model.predict(X_test)
 dt_r2 = r2_score(y_test, dt_preds)
 
 print(f"\nDecision Tree Test R² Score: {dt_r2:.6f}")
+
 # ==============================================================================
-# BLOCK 3: RANDOM FOREST WORKHORSE (XGBoost bypassed)
+# BLOCK 3: THE ENSEMBLE WORKHORSES
 # ==============================================================================
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
 
 print("\n--- Block 3: Training Ensemble Workhorses ---")
 
-# 6. Model 3: Random Forest (Averaging trees to squash variance noise)
-rf_model = RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42)
+# 6. Random Forest
+rf_model = RandomForestRegressor(n_estimators=100, max_depth=3, random_state=42)
 rf_model.fit(X_train, y_train)
 rf_preds = rf_model.predict(X_test)
 rf_r2 = r2_score(y_test, rf_preds)
-
 print(f"Random Forest Test R² Score: {rf_r2:.6f}")
 
-# (XGBoost is commented out for now to bypass the Anaconda installation block)
-# from xgboost import XGBRegressor
-# xgb_model = XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.05, random_state=42)
-# xgb_model.fit(X_train, y_train)
-# xgb_preds = xgb_model.predict(X_test)
-# xgb_r2 = r2_score(y_test, xgb_preds)
-# print(f"XGBoost Test R² Score: {xgb_r2:.6f}")
+# 7. Native Gradient Boosting (Scikit-Learn's built-in version of XGBoost/LightGBM)
+# This requires ZERO C++ compilers and runs perfectly on Mac M-Series chips!
+hgb_model = HistGradientBoostingRegressor(
+    max_iter=50,          # Equivalent to n_estimators
+    max_depth=3,
+    learning_rate=0.03,
+    random_state=42
+)
+hgb_model.fit(X_train, y_train)
+hgb_preds = hgb_model.predict(X_test)
+hgb_r2 = r2_score(y_test, hgb_preds)
+print(f"Gradient Boosting Test R² Score: {hgb_r2:.6f}")
 
 
 # ==============================================================================
