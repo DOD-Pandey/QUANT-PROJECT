@@ -85,4 +85,106 @@ sns.heatmap(
 plt.title("Feature Correlation Matrix Heatmap", fontsize=14, fontweight="bold")
 plt.tight_layout()
 # 8. Render the plot to your screen
-plt.show()
+# plt.show()  # Commented out so the script runs straight through to the models!
+
+# The target: Tomorrow's return, aligned to today's feature row
+df['target'] = df['log_return'].shift(-1)
+
+# ==============================================================================
+# PHASE 3: ML MODELING ENGINE (BLOCK 1 & 2)
+# ==============================================================================
+
+# 1. Create the prediction target (Tomorrow's return)
+df['target'] = df['log_return'].shift(-1)
+
+# Drop any remaining NaNs safely after target creation
+df_ml = df.dropna().copy()
+
+# 2. Define features (X) and target (y) Matrices
+feature_cols = ['sma_20', 'volatility_20', 'price_vs_sma', 'rsi_14', 
+                'volume_ratio', 'return_lag_1', 'return_lag_5', 'vol_ratio']
+
+X = df_ml[feature_cols]
+y = df_ml['target']
+
+# 3. Chronological Time-Series Split (80% Train, 20% Test) - NO SHUFFLING!
+split_idx = int(len(df_ml) * 0.80)
+
+X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+print("\n--- Block 1: Data Dimensions ---")
+print(f"Training set rows: {X_train.shape[0]} | Testing set rows: {X_test.shape[0]}")
+
+from sklearn.linear_model import LinearRegression
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.metrics import r2_score
+
+print("\n--- Block 2: Training Baselines ---")
+
+# 4. Model 1: Linear Regression Baseline
+lr_model = LinearRegression()
+lr_model.fit(X_train, y_train)
+lr_preds = lr_model.predict(X_test)
+lr_r2 = r2_score(y_test, lr_preds)
+
+print(f"Linear Regression Baseline Test R² Score: {lr_r2:.6f}")
+print("Linear Regression Coefficients (Feature Weights):")
+for name, coef in zip(feature_cols, lr_model.coef_):
+    print(f"  {name}: {coef:.6f}")
+
+# 5. Model 2: Decision Tree Baseline (Shallow depth to restrict overfitting)
+dt_model = DecisionTreeRegressor(max_depth=4, random_state=42)
+dt_model.fit(X_train, y_train)
+dt_preds = dt_model.predict(X_test)
+dt_r2 = r2_score(y_test, dt_preds)
+
+print(f"\nDecision Tree Test R² Score: {dt_r2:.6f}")
+# ==============================================================================
+# BLOCK 3: RANDOM FOREST WORKHORSE (XGBoost bypassed)
+# ==============================================================================
+from sklearn.ensemble import RandomForestRegressor
+
+print("\n--- Block 3: Training Ensemble Workhorses ---")
+
+# 6. Model 3: Random Forest (Averaging trees to squash variance noise)
+rf_model = RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42)
+rf_model.fit(X_train, y_train)
+rf_preds = rf_model.predict(X_test)
+rf_r2 = r2_score(y_test, rf_preds)
+
+print(f"Random Forest Test R² Score: {rf_r2:.6f}")
+
+# (XGBoost is commented out for now to bypass the Anaconda installation block)
+# from xgboost import XGBRegressor
+# xgb_model = XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.05, random_state=42)
+# xgb_model.fit(X_train, y_train)
+# xgb_preds = xgb_model.predict(X_test)
+# xgb_r2 = r2_score(y_test, xgb_preds)
+# print(f"XGBoost Test R² Score: {xgb_r2:.6f}")
+
+
+# ==============================================================================
+# BLOCK 4: FEATURE IMPORTANCE DIAGNOSTICS
+# ==============================================================================
+import matplotlib.pyplot as plt
+
+print("\n--- Block 4: Plotting Feature Importances ---")
+
+# Extract importance values from our trained Random Forest
+importances = rf_model.feature_importances_
+sorted_idx = np.argsort(importances)
+
+# Generate a horizontal bar plot
+plt.figure(figsize=(10, 6))
+plt.barh(range(len(sorted_idx)), importances[sorted_idx], color="skyblue", edgecolor="black")
+plt.yticks(range(len(sorted_idx)), [feature_cols[i] for i in sorted_idx])
+plt.xlabel('Relative Importance Score', fontsize=12, fontweight='bold')
+plt.title('What Did Our Model Learn? (Random Forest Feature Importance)', fontsize=14, fontweight='bold')
+plt.tight_layout()
+
+# Save the plot directly as an image file so it doesn't freeze your terminal!
+plt.savefig('feature_importance.png')
+print("🚀 Success! Feature importance plot has been saved cleanly as 'feature_importance.png'.")
+
+
