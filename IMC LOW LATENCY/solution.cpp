@@ -1,5 +1,6 @@
 #include "api.hpp"
-// EXPERIMENT v22a = v21 + skip 3 in 4 update-quotes of an option after a loss on its current vol.
+// v25 = v21 + after a loss on an option's current vol, skip most of its update-quotes until the next V;
+// how many is learned per option from the quotes still sent after a loss (earning -> 3 in 4, losing -> 31 in 32).
 
 #include <algorithm>
 #include <chrono>
@@ -129,6 +130,7 @@ class Solution : public ISolution {
         double a1, a2; long aTV; int hasAnch;           // candidate vols from the previous quote
         int invOn; unsigned period; int lossRun;         // inversion used in this V period?
         double sOn, nOn, sOff, nOff;                     // stale-quote profit (normalized) with / without
+        double plS, plN;                                 // profit (normalized) of update-quotes sent after a loss
         // cached price for repeat quotes
         double cPrice, cVega;
         unsigned cSV;
@@ -149,6 +151,7 @@ class Solution : public ISolution {
         int src;   // 0/1 = quote on update (own / borrowed vol), 2/3 = repeat quote
         int grp;   // pooled-table row: src * NC + state for quotes on updates, NGRP + (src - 2) for repeats
         int kind;  // 0 = none, 1 = fresh (right after V), 2 = fresh with deliberate offset, 3 = stale own-vol
+        int pl;    // quote sent although the option's last quote on this vol lost
         int inv;   // inversion was on for this quote's V period
         double sq, vq, off, lnq;  // vol used, its vega, price offset, ln S at the quote
         long tvq;  // V period of the quote
@@ -417,6 +420,7 @@ class Solution : public ISolution {
             if (src >= 2) {
                 eS = eS * 0.9995 + z; eS2 = eS2 * 0.9995 + z * z; eN = eN * 0.9995 + 1.0;
             }
+            if (p.pl) { x.plS = 0.98 * x.plS + z; x.plN = 0.98 * x.plN + 1; }
             if (USE_INV && p.kind != 0) invLearn(x, p, pr);
         }
     }
@@ -501,8 +505,14 @@ class Solution : public ISolution {
             vega = 0;
         }
         if (!std::isfinite(price)) return;
-        // v22a: last own-vol quote on this vol lost -> skip 3 in 4 quotes on updates too (until the next V)
-        if (src == 0 && step != tV && x.cls == 4 && (++o[p].lossSkip % 4) != 0) return;
+        // last own-vol quote on this vol lost -> skip most quotes on updates too (until the next V);
+        // how many is learned from the quotes that are still sent in that state
+        int postLoss = 0;
+        if (src == 0 && step != tV && x.cls == 4) {
+            unsigned k = x.plN < 5 ? 8u : (x.plS > 0 ? 4u : 32u);
+            if ((++o[p].lossSkip % k) != 0) return;
+            postLoss = 1;
+        }
 
         long s = step - tV;
         int b = sBucket(s);
@@ -523,6 +533,7 @@ class Solution : public ISolution {
         }
 
         Pend pd{x.id, p, (int)slot, q, m, src, g};
+        pd.pl = postLoss;
         if (USE_INV && src == 0) {
             Opt& w = o[p];
             pd.sq = sig; pd.vq = vega; pd.lnq = lnS; pd.tvq = tV; pd.inv = w.invOn;
