@@ -1,4 +1,6 @@
 #include "api.hpp"
+// v29a = v28 with the main gate cutting when losing by > 1.0 standard errors (was 2).
+// v28 = v27 + the same learned skipping after a MEDIUM profit (0.33 to 0.66 x typical gain), own statistics.
 // v27 = v26a + after a WEAK profit (0 < profit < 0.33 x typical gain) on the current vol, each option
 // learns whether its following quotes lose; only if they do on average, 7 in 8 of them are skipped.
 // v26a = v25 + repeat quotes also learn their post-loss skip per option (own statistics).
@@ -103,7 +105,7 @@ class Solution : public ISolution {
     static constexpr double POOL_OPT = 0.5; // optimistic normalized prior for unseen pooled buckets
     static constexpr double FADE = 0.99;    // old results fade: ~100 most recent quotes per situation count
     static constexpr double CAP_NS = 5.0e8;  // processing time we allow ourselves (budget is 1s)
-    static constexpr double ZCUT = 2.0;     // only stop quoting a situation if it is losing by > 2 standard errors
+    static constexpr double ZCUT = 1.0;     // only stop quoting a situation if it is losing by > 2 standard errors
     // A cut situation is still sampled now and then so the gate keeps learning about it:
     // every 4th chance if it is near break-even, every 16th if clearly negative, every 64th if very negative.
 
@@ -136,6 +138,7 @@ class Solution : public ISolution {
         double plS, plN;                                 // profit (normalized) of update-quotes sent after a loss
         double rpS, rpN;                                 // same for repeat quotes sent after a loss
         double wkS, wkN, wrS, wrN;                       // same after a weak profit: update quotes / repeats
+        double mdS, mdN, mrS, mrN;                       // same after a medium profit: update quotes / repeats
         unsigned weakSkip;
         // cached price for repeat quotes
         double cPrice, cVega;
@@ -430,6 +433,8 @@ class Solution : public ISolution {
             else if (p.pl == 2) { x.rpS = 0.98 * x.rpS + z; x.rpN = 0.98 * x.rpN + 1; }
             else if (p.pl == 3) { x.wkS = 0.98 * x.wkS + z; x.wkN = 0.98 * x.wkN + 1; }
             else if (p.pl == 4) { x.wrS = 0.98 * x.wrS + z; x.wrN = 0.98 * x.wrN + 1; }
+            else if (p.pl == 5) { x.mdS = 0.98 * x.mdS + z; x.mdN = 0.98 * x.mdN + 1; }
+            else if (p.pl == 6) { x.mrS = 0.98 * x.mrS + z; x.mrN = 0.98 * x.mrN + 1; }
             if (USE_INV && p.kind != 0) invLearn(x, p, pr);
         }
     }
@@ -525,6 +530,10 @@ class Solution : public ISolution {
             unsigned k = (x.wkN < 10 || x.wkS > 0) ? 1u : 8u;
             if (k > 1 && (++o[p].weakSkip % k) != 0) return;
             postLoss = 3;
+        } else if (src == 0 && step != tV && x.cls == 2) {
+            unsigned k = (x.mdN < 10 || x.mdS > 0) ? 1u : 8u;
+            if (k > 1 && (++o[p].weakSkip % k) != 0) return;
+            postLoss = 5;
         }
 
         long s = step - tV;
@@ -638,6 +647,10 @@ class Solution : public ISolution {
             unsigned k = (x.wrN < 10 || x.wrS > 0) ? 1u : 8u;
             if (k > 1 && (++x.weakSkip % k) != 0) return;
             postLoss = 4;
+        } else if (USE_SKIP && src == 0 && x.cls == 2) {
+            unsigned k = (x.mrN < 10 || x.mrS > 0) ? 1u : 8u;
+            if (k > 1 && (++x.weakSkip % k) != 0) return;
+            postLoss = 6;
         }
         long s = step - tV;
         int q = qBucket(s, x.cVega);
