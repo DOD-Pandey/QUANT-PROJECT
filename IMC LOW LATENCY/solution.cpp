@@ -1,6 +1,5 @@
 #include "api.hpp"
-// EXPERIMENT v19 (one change on v15): the vol-vs-stock fit is done in log vol:
-//   d ln(vol) = beta * d ln(S),  vol now = last V * exp(beta * (ln S now - ln S at that V)).
+// EXPERIMENT v22a = v21 + skip 3 in 4 update-quotes of an option after a loss on its current vol.
 
 #include <algorithm>
 #include <chrono>
@@ -27,6 +26,18 @@
 #ifndef USE_SKIP
 #define USE_SKIP 1
 #endif
+#ifndef USE_CURV
+#define USE_CURV 1
+#endif
+#ifndef USE_COMMON
+#define USE_COMMON 0
+#endif
+#ifndef USE_POOL
+#define USE_POOL 0
+#endif
+#ifndef USE_INV
+#define USE_INV 1
+#endif
 #ifndef XK
 #define XK 0.8
 #endif
@@ -50,10 +61,25 @@
 // judged by pooled statistics of their own (normalized profit per staleness x vega^2 bucket), cut when
 // confidently losing, paced against the time budget, and switched off as a whole if they lose overall.
 //
-// Vol moving with the stock (v15): for each option we fit, from consecutive V updates,
-//   (change in vol) = beta * (change in ln S over the same period)
-// and between V updates use vol = last V + beta * (ln S now - ln S at that V). beta is shrunk
-// towards 0 unless it is statistically clear, so with no such relationship nothing changes.
+// Vol moving with the stock (v16): for each option we fit, from consecutive V updates,
+//   (change in vol) = b1 * d(x) + b2 * d(x^2) + b3 * d(C)
+// where x = ln(S/K) (moneyness; b2 captures smile curvature) and C is the per-stock running sum of
+// the vol moves of the other options on that stock that x does not explain (a common vol level).
+// Between V updates: vol = last V + b1 * (x now - x then) + b2 * (x^2 now - x^2 then) + b3 * (C now - C then).
+// Each coefficient is shrunk towards 0 unless statistically clear; options with fewer than 20 V
+// updates use the fit pooled over all options on the same stock.
+// v20: every option keeps two fits, straight (b1 only) and curved (b1, b2). At each new V, before
+// learning from it, both predict that vol change; the option uses whichever has the lower recent
+// squared prediction error.
+//
+// Profit inversion (from v18): right after a V our price is exact, so its profit p0 is the option's best.
+// A few of those quotes are deliberately off by a known amount to calibrate how profit falls with error
+// (linear: p = p0 * (1 - |err| / theta)). A stale quote's profit then gives |err|, i.e. two candidate
+// vols (quoted vol +- |err| / vega); the one consistent with the previous candidates is used next.
+// Each option A/B-tests this on itself (V periods alternate on/off until both have 20 stale quotes,
+// then the better mode is used). v21: where "off" is clearly better, the other mode is re-tested only
+// 1 period in 256 and calibration drops to 1 fresh quote in 512, so options that do not benefit pay
+// almost nothing. Two losing stale quotes in a row switch it off for the period.
 //
 // Vol sources: an option's own last V update. If an option has never had one,
 // it borrows the vol of the nearest-strike option on the same underlying; this
@@ -91,7 +117,18 @@ class Solution : public ISolution {
         long tV;       // step of last own V
         double sigPrev; int hasPrev;   // vol before the last own V
         double lnSV; int hasLnSV;      // ln S when the last own V arrived
-        double rn, rxx, rxy, ryy, beta; // fit of vol change vs ln S change between V updates
+        double cV;                      // common-move sum C of its stock when the last own V arrived
+        int fit;                        // index into fits (per option)
+        double errL, errC;              // recent squared prediction errors: straight / curved fit
+        int useC;                       // 1 = use the curved fit
+        // profit inversion
+        double p0; int p0n;            // typical profit of an exact (fresh) quote
+        double theta; int calN;        // price error at which profit reaches 0 (calibrated)
+        unsigned freshCnt;
+        double estSig, estLnS; long estTV; int estVer;  // vol inferred from the last stale quote's profit
+        double a1, a2; long aTV; int hasAnch;           // candidate vols from the previous quote
+        int invOn; unsigned period; int lossRun;         // inversion used in this V period?
+        double sOn, nOn, sOff, nOff;                     // stale-quote profit (normalized) with / without
         // cached price for repeat quotes
         double cPrice, cVega;
         unsigned cSV;
@@ -111,6 +148,10 @@ class Solution : public ISolution {
         double scale;
         int src;   // 0/1 = quote on update (own / borrowed vol), 2/3 = repeat quote
         int grp;   // pooled-table row: src * NC + state for quotes on updates, NGRP + (src - 2) for repeats
+        int kind;  // 0 = none, 1 = fresh (right after V), 2 = fresh with deliberate offset, 3 = stale own-vol
+        int inv;   // inversion was on for this quote's V period
+        double sq, vq, off, lnq;  // vol used, its vega, price offset, ln S at the quote
+        long tvq;  // V period of the quote
     };
 
     std::vector<Reg> regs;
@@ -145,6 +186,61 @@ class Solution : public ISolution {
     double gAbs = 0, gCnt = 0;        // global |profit| scale
 
     std::vector<Pend> pend, pendNext;
+
+    // least-squares fit of vol change on up to 3 features, with exponential forgetting
+    struct Fit {
+        double n = 0, A[3][3] = {}, r[3] = {}, yy = 0, b[3] = {};
+        void add(const double f[3], double y) {
+            const double D = 0.998;
+            n = n * D + 1;
+            yy = yy * D + y * y;
+            for (int i = 0; i < 3; i++) {
+                r[i] = r[i] * D + f[i] * y;
+                for (int j = 0; j < 3; j++) A[i][j] = A[i][j] * D + f[i] * f[j];
+            }
+        }
+        void solve() {
+            b[0] = b[1] = b[2] = 0;
+            if (n < 20) return;
+            int idx[3], k = 0;
+            for (int i = 0; i < 3; i++) if (A[i][i] > 1e-18) idx[k++] = i;
+            if (k == 0) return;
+            double M[3][6] = {};
+            for (int i = 0; i < k; i++) {
+                for (int j = 0; j < k; j++) M[i][j] = A[idx[i]][idx[j]];
+                M[i][i] *= 1.0 + 1e-9;
+                M[i][k + i] = 1.0;
+            }
+            for (int c = 0; c < k; c++) {  // Gauss-Jordan inverse
+                int pv = c;
+                for (int i = c + 1; i < k; i++) if (std::fabs(M[i][c]) > std::fabs(M[pv][c])) pv = i;
+                if (std::fabs(M[pv][c]) < 1e-300) return;
+                if (pv != c) for (int j = 0; j < 2 * k; j++) std::swap(M[pv][j], M[c][j]);
+                double d = M[c][c];
+                for (int j = 0; j < 2 * k; j++) M[c][j] /= d;
+                for (int i = 0; i < k; i++) {
+                    if (i == c) continue;
+                    double f = M[i][c];
+                    if (f != 0) for (int j = 0; j < 2 * k; j++) M[i][j] -= f * M[c][j];
+                }
+            }
+            double bb[3] = {}, rss = yy;
+            for (int i = 0; i < k; i++) {
+                for (int j = 0; j < k; j++) bb[i] += M[i][k + j] * r[idx[j]];
+                rss -= bb[i] * r[idx[i]];
+            }
+            double s2 = std::max(rss, 0.0) / std::max(n - k, 1.0);
+            for (int i = 0; i < k; i++) {
+                double v = s2 * M[i][k + i];
+                double t2 = v > 0 ? bb[i] * bb[i] / v : 1e9;
+                double sh = t2 > 4.0 ? 1.0 - 4.0 / t2 : 0.0;
+                if (std::isfinite(bb[i])) b[idx[i]] = bb[i] * sh;
+            }
+        }
+    };
+    std::vector<Fit> fits, ufits;   // per option, per stock (pooled): curved
+    std::vector<Fit> fitsL;         // per option: straight
+    std::vector<double> commonC;    // per stock: running sum of unexplained vol moves
 
     static inline double cnd(double x, double& e) {
         double ax = std::fabs(x);
@@ -278,6 +374,10 @@ class Solution : public ISolution {
         hasSpot.assign(nU, 0);
         spotVer.assign(nU, 0u);
         uMean.assign(nU, 0.0); uMeanN.assign(nU, 0);
+        fits.assign(n, Fit{});
+        fitsL.assign(n, Fit{});
+        ufits.assign(nU, Fit{});
+        commonC.assign(nU, 0.0);
         tN.assign((size_t)n * NGRP * NB, 0.f);
         tS.assign((size_t)n * NGRP * NB, 0.f);
         tQ.assign((size_t)n * NGRP * NB, 0.f);
@@ -317,7 +417,63 @@ class Solution : public ISolution {
             if (src >= 2) {
                 eS = eS * 0.9995 + z; eS2 = eS2 * 0.9995 + z * z; eN = eN * 0.9995 + 1.0;
             }
+            if (USE_INV && p.kind != 0) invLearn(x, p, pr);
         }
+    }
+
+    // Is inversion still being tested, or winning, for this option?
+    static inline bool invUseful(const Opt& x) {
+        if (x.nOn < 20 || x.nOff < 20) return true;
+        return x.sOn / x.nOn >= x.sOff / x.nOff;
+    }
+
+    void invLearn(Opt& x, const Pend& p, double pr) {
+        if (p.kind == 3) {  // A/B bookkeeping (whether or not a newer V has arrived)
+            const double D = 0.999;
+            double z = pr / p.scale;
+            if (p.inv) { x.sOn = x.sOn * D + z; x.nOn = x.nOn * D + 1; }
+            else { x.sOff = x.sOff * D + z; x.nOff = x.nOff * D + 1; }
+        }
+        if (p.tvq != x.tV) return;  // a newer V has arrived since
+        if (p.kind == 3 && p.inv && x.invOn) {  // circuit breaker
+            if (pr < 0) { if (++x.lossRun >= 2) x.invOn = 0; }
+            else x.lossRun = 0;
+        }
+        if (p.kind == 1 || p.kind == 2) {
+            if (p.kind == 1) {
+                x.p0 = x.p0n == 0 ? pr : x.p0 + 0.05 * (pr - x.p0);
+                x.p0n++;
+            } else if (x.p0 > 0) {
+                double off = std::fabs(p.off);
+                if (pr < 0.98 * x.p0) {
+                    double th = off / (1.0 - pr / x.p0);
+                    x.theta = x.calN == 0 ? th : std::exp(std::log(x.theta) + 0.1 * (std::log(th) - std::log(x.theta)));
+                    x.calN++;
+                } else {
+                    x.theta = 2.0 * std::max(x.theta, off);  // offset too small to notice: try larger
+                }
+            }
+            x.a1 = x.a2 = p.sq; x.aTV = p.tvq; x.hasAnch = 1;
+            return;
+        }
+        if (x.p0n < 3 || !(x.p0 > 0) || x.calN < 2 || !(p.vq > 0) || !(x.theta > 0)) return;
+        double eps = x.theta * (1.0 - pr / x.p0);
+        if (eps < 0) eps = 0;
+        if (eps > 5.0 * x.theta) eps = 5.0 * x.theta;
+        double ds = eps / p.vq;
+        double cp = p.sq + ds, cm = p.sq - ds;
+        double c = cp;
+        bool resolved = ds < 1e-9;
+        if (x.hasAnch && x.aTV == p.tvq) {
+            double dp = std::min(std::fabs(cp - x.a1), std::fabs(cp - x.a2));
+            double dm = std::min(std::fabs(cm - x.a1), std::fabs(cm - x.a2));
+            c = dp <= dm ? cp : cm;
+            if (std::fabs(dp - dm) > 0.5 * ds) resolved = true;
+        }
+        if (c < 0.01) c = 0.01;
+        x.estSig = c; x.estLnS = p.lnq; x.estTV = p.tvq; x.estVer++;
+        if (resolved) { x.a1 = x.a2 = c; } else { x.a1 = cp; x.a2 = cm; }
+        x.aTV = p.tvq; x.hasAnch = 1;
     }
 
     inline double scaleOf(const Opt& x) const {
@@ -345,6 +501,8 @@ class Solution : public ISolution {
             vega = 0;
         }
         if (!std::isfinite(price)) return;
+        // v22a: last own-vol quote on this vol lost -> skip 3 in 4 quotes on updates too (until the next V)
+        if (src == 0 && step != tV && x.cls == 4 && (++o[p].lossSkip % 4) != 0) return;
 
         long s = step - tV;
         int b = sBucket(s);
@@ -364,8 +522,25 @@ class Solution : public ISolution {
             if (++tC[slot] % every != 0) return;  // skip, but sample occasionally
         }
 
+        Pend pd{x.id, p, (int)slot, q, m, src, g};
+        if (USE_INV && src == 0) {
+            Opt& w = o[p];
+            pd.sq = sig; pd.vq = vega; pd.lnq = lnS; pd.tvq = tV; pd.inv = w.invOn;
+            if (step == tV) {
+                pd.kind = 1;
+                // calibrate 1 in 8 fresh quotes, 1 in 64 once settled, 1 in 512 if inversion is losing
+                unsigned cmask = !invUseful(w) ? 511u : (w.calN >= 10 ? 63u : 7u);
+                if ((++w.freshCnt & cmask) == 0 && w.p0n >= 3 && w.p0 > 0) {  // calibration quote
+                    double th = w.theta > 0 ? w.theta : 0.002 * std::max(price, 1e-6);
+                    pd.off = ((w.freshCnt >> 6) ^ (w.freshCnt >> 3)) & 1 ? 0.5 * th : -0.5 * th;
+                    if (price + pd.off > 0) { price += pd.off; pd.kind = 2; } else pd.off = 0;
+                }
+            } else {
+                pd.kind = 3;
+            }
+        }
         out.push_back(Valuation{x.id, price});
-        pendNext.push_back(Pend{x.id, p, (int)slot, q, m, src, g});
+        pendNext.push_back(pd);
     }
 
     inline void calc(const Opt& x, double sig, double a, double inv, double sst,
@@ -392,7 +567,7 @@ class Solution : public ISolution {
         int src, sib = -1;
         long tV;
         double sig, a, inv, sst;
-        int cb = 0;
+        int cb = USE_INV ? x.estVer : 0;
         if (x.own) {
             src = 0; tV = x.tV;
 #if PRED
@@ -444,8 +619,13 @@ class Solution : public ISolution {
             if (++tCq[g][q] % every != 0) return;
         }
         double m = scaleOf(x);
+        Pend pd{x.id, p, -1, q, m, es, g};
+        if (USE_INV && src == 0) {
+            pd.kind = step == tV ? 1 : 3;
+            pd.sq = sig; pd.vq = x.cVega; pd.lnq = lnSpot[u]; pd.tvq = tV; pd.inv = x.invOn;
+        }
         out.push_back(Valuation{x.id, price});
-        pendNext.push_back(Pend{x.id, p, -1, q, m, es, g});
+        pendNext.push_back(pd);
     }
 
     inline double meanFor(int u) const { return uMeanN[u] >= 3 ? uMean[u] : gMean; }
@@ -495,13 +675,32 @@ class Solution : public ISolution {
 #endif
     }
 
-    // Current vol estimate: last V, moved with the stock if the fitted relationship is clear.
+    inline const double* coefOf(int p) const {
+        if (!o[p].useC) return fitsL[p].b;
+        const Fit& f = fits[p];
+        return (f.n >= 20 || !USE_POOL) ? f.b : ufits[o[p].u].b;
+    }
+
+    // Current vol estimate: last V, moved with the stock / common level if the fit is clear.
     inline double sigNow(const Opt& x) const {
-        if (!x.own || x.beta == 0 || !x.hasLnSV || !hasSpot[x.u]) return x.sig;
-        double d = x.beta * (lnSpot[x.u] - x.lnSV);  // change in ln(vol)
-        if (d > 0.4) d = 0.4;
-        if (d < -0.4) d = -0.4;
-        return x.sig * std::exp(d);
+        if (!x.own || !hasSpot[x.u]) return x.sig;
+        if (USE_INV && x.invOn && x.estTV == x.tV && x.estVer > 0) {  // vol inferred from feedback in this V period
+            const double* bi = coefOf((int)(&x - o.data()));
+            double d = bi[0] * (lnSpot[x.u] - x.estLnS);
+            double lim = 0.5 * x.estSig;
+            if (d > lim) d = lim;
+            if (d < -lim) d = -lim;
+            return x.estSig + d;
+        }
+        if (!x.hasLnSV) return x.sig;
+        const double* b = coefOf((int)(&x - o.data()));
+        if (b[0] == 0 && b[1] == 0 && b[2] == 0) return x.sig;
+        double x1 = lnSpot[x.u] - x.lnK, x0 = x.lnSV - x.lnK;
+        double d = b[0] * (x1 - x0) + b[1] * (x1 * x1 - x0 * x0) + b[2] * (commonC[x.u] - x.cV);
+        double lim = 0.5 * x.sig;
+        if (d > lim) d = lim;
+        if (d < -lim) d = -lim;
+        return x.sig + d;
     }
 
     inline void quoteOption(int p, double S, double lnS, std::vector<Valuation>& out) {
@@ -546,22 +745,34 @@ class Solution : public ISolution {
             uMean[u] = uMeanN[u] == 0 ? sig : uMean[u] + 0.05 * (sig - uMean[u]); uMeanN[u]++;
         }
 #endif
-        {   // learn how this option's vol moves with its stock
+        {   // learn how this option's vol moves with its stock and with the other options' vols
             int u = x.u;
             if (x.own && x.hasLnSV && hasSpot[u] && x.sig > 0 && sig > 0) {
-                const double D = 0.998;
-                double dx = lnSpot[u] - x.lnSV, dy = std::log(sig) - std::log(x.sig);
-                x.rn = x.rn * D + 1; x.rxx = x.rxx * D + dx * dx; x.rxy = x.rxy * D + dx * dy; x.ryy = x.ryy * D + dy * dy;
-                x.beta = 0;
-                if (x.rn >= 20 && x.rxx > 0) {
-                    double b = x.rxy / x.rxx;
-                    double res = std::max(0.0, (x.ryy - b * x.rxy) / x.rn);
-                    double se2 = res / x.rxx;
-                    double t2 = se2 > 0 ? b * b / se2 : 1e9;
-                    if (t2 > 4.0) x.beta = b * (1.0 - 4.0 / t2);
+                double x1 = lnSpot[u] - x.lnK, x0 = x.lnSV - x.lnK;
+                double f[3] = {x1 - x0, USE_CURV ? x1 * x1 - x0 * x0 : 0.0, USE_COMMON ? commonC[u] - x.cV : 0.0};
+                double y = sig - x.sig;
+                const double* b = coefOf(p);
+                double z = y - b[0] * f[0] - b[1] * f[1];  // vol move not explained by the stock
+                {   // which model predicted this vol change better?
+                    const double* bl = fitsL[p].b;
+                    const double* bc = fits[p].b;
+                    double eL = y - bl[0] * f[0];
+                    double eC = y - bc[0] * f[0] - bc[1] * f[1] - bc[2] * f[2];
+                    x.errL = 0.995 * x.errL + eL * eL;
+                    x.errC = 0.995 * x.errC + eC * eC;
+                    x.useC = fits[p].n >= 20 && x.errC < x.errL;
                 }
+                double fl[3] = {f[0], 0.0, 0.0};
+                fitsL[p].add(fl, y);
+                fitsL[p].solve();
+                fits[p].add(f, y);
+                fits[p].solve();
+                ufits[u].add(f, y);
+                ufits[u].solve();
+                commonC[u] += z;
             }
             if (hasSpot[u]) { x.lnSV = lnSpot[u]; x.hasLnSV = 1; } else { x.hasLnSV = 0; }
+            x.cV = commonC[u];
         }
         x.sig = sig;
         x.sst = sig * x.sqrtT;
@@ -569,6 +780,17 @@ class Solution : public ISolution {
         x.a = (R + 0.5 * sig * sig) * x.T - x.lnK;
         x.tV = step;
         x.cls = 0;
+        {   // choose inversion on/off for this V period
+            x.period++;
+            x.lossRun = 0;
+            if (x.nOn < 20 || x.nOff < 20) x.invOn = (int)(x.period & 1);
+            else {
+                double mOn = x.sOn / x.nOn, mOff = x.sOff / x.nOff;
+                int best = mOn > mOff;
+                unsigned every = std::fabs(mOn - mOff) > 0.3 ? (best ? 64u : 256u) : 8u;
+                x.invOn = (x.period % every == 0) ? !best : best;
+            }
+        }
         bool wasOwn = x.own;
         x.own = 1;
         if (!wasOwn) {
