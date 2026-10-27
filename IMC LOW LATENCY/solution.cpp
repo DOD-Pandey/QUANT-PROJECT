@@ -1,5 +1,5 @@
 #include "api.hpp"
-// v29a = v28 with the main gate cutting when losing by > 1.0 standard errors (was 2).
+// v30a = v28 with the vol-vs-stock fits in log vol: d ln(vol) = b1 d(x) + b2 d(x^2), vol now = last V * exp(...).
 // v28 = v27 + the same learned skipping after a MEDIUM profit (0.33 to 0.66 x typical gain), own statistics.
 // v27 = v26a + after a WEAK profit (0 < profit < 0.33 x typical gain) on the current vol, each option
 // learns whether its following quotes lose; only if they do on average, 7 in 8 of them are skipped.
@@ -105,7 +105,7 @@ class Solution : public ISolution {
     static constexpr double POOL_OPT = 0.5; // optimistic normalized prior for unseen pooled buckets
     static constexpr double FADE = 0.99;    // old results fade: ~100 most recent quotes per situation count
     static constexpr double CAP_NS = 5.0e8;  // processing time we allow ourselves (budget is 1s)
-    static constexpr double ZCUT = 1.0;     // only stop quoting a situation if it is losing by > 2 standard errors
+    static constexpr double ZCUT = 2.0;     // only stop quoting a situation if it is losing by > 2 standard errors
     // A cut situation is still sampled now and then so the gate keeps learning about it:
     // every 4th chance if it is near break-even, every 16th if clearly negative, every 64th if very negative.
 
@@ -734,21 +734,19 @@ class Solution : public ISolution {
         if (!x.own || !hasSpot[x.u]) return x.sig;
         if (USE_INV && x.invOn && x.estTV == x.tV && x.estVer > 0) {  // vol inferred from feedback in this V period
             const double* bi = coefOf((int)(&x - o.data()));
-            double d = bi[0] * (lnSpot[x.u] - x.estLnS);
-            double lim = 0.5 * x.estSig;
-            if (d > lim) d = lim;
-            if (d < -lim) d = -lim;
-            return x.estSig + d;
+            double d = bi[0] * (lnSpot[x.u] - x.estLnS);  // change in ln(vol)
+            if (d > 0.4) d = 0.4;
+            if (d < -0.4) d = -0.4;
+            return x.estSig * std::exp(d);
         }
         if (!x.hasLnSV) return x.sig;
         const double* b = coefOf((int)(&x - o.data()));
         if (b[0] == 0 && b[1] == 0 && b[2] == 0) return x.sig;
         double x1 = lnSpot[x.u] - x.lnK, x0 = x.lnSV - x.lnK;
-        double d = b[0] * (x1 - x0) + b[1] * (x1 * x1 - x0 * x0) + b[2] * (commonC[x.u] - x.cV);
-        double lim = 0.5 * x.sig;
-        if (d > lim) d = lim;
-        if (d < -lim) d = -lim;
-        return x.sig + d;
+        double d = b[0] * (x1 - x0) + b[1] * (x1 * x1 - x0 * x0) + b[2] * (commonC[x.u] - x.cV);  // change in ln(vol)
+        if (d > 0.4) d = 0.4;
+        if (d < -0.4) d = -0.4;
+        return x.sig * std::exp(d);
     }
 
     inline void quoteOption(int p, double S, double lnS, std::vector<Valuation>& out) {
@@ -798,7 +796,7 @@ class Solution : public ISolution {
             if (x.own && x.hasLnSV && hasSpot[u] && x.sig > 0 && sig > 0) {
                 double x1 = lnSpot[u] - x.lnK, x0 = x.lnSV - x.lnK;
                 double f[3] = {x1 - x0, USE_CURV ? x1 * x1 - x0 * x0 : 0.0, USE_COMMON ? commonC[u] - x.cV : 0.0};
-                double y = sig - x.sig;
+                double y = std::log(sig) - std::log(x.sig);  // v30a: change in ln(vol)
                 const double* b = coefOf(p);
                 double z = y - b[0] * f[0] - b[1] * f[1];  // vol move not explained by the stock
                 {   // which model predicted this vol change better?
