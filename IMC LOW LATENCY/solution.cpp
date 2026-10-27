@@ -1,4 +1,6 @@
 #include "api.hpp"
+// EXPERIMENT v19 (one change on v15): the vol-vs-stock fit is done in log vol:
+//   d ln(vol) = beta * d ln(S),  vol now = last V * exp(beta * (ln S now - ln S at that V)).
 
 #include <algorithm>
 #include <chrono>
@@ -25,15 +27,6 @@
 #ifndef USE_SKIP
 #define USE_SKIP 1
 #endif
-#ifndef USE_CURV
-#define USE_CURV 1
-#endif
-#ifndef USE_COMMON
-#define USE_COMMON 0
-#endif
-#ifndef USE_POOL
-#define USE_POOL 0
-#endif
 #ifndef XK
 #define XK 0.8
 #endif
@@ -57,13 +50,10 @@
 // judged by pooled statistics of their own (normalized profit per staleness x vega^2 bucket), cut when
 // confidently losing, paced against the time budget, and switched off as a whole if they lose overall.
 //
-// Vol moving with the stock (v16): for each option we fit, from consecutive V updates,
-//   (change in vol) = b1 * d(x) + b2 * d(x^2) + b3 * d(C)
-// where x = ln(S/K) (moneyness; b2 captures smile curvature) and C is the per-stock running sum of
-// the vol moves of the other options on that stock that x does not explain (a common vol level).
-// Between V updates: vol = last V + b1 * (x now - x then) + b2 * (x^2 now - x^2 then) + b3 * (C now - C then).
-// Each coefficient is shrunk towards 0 unless statistically clear; options with fewer than 20 V
-// updates use the fit pooled over all options on the same stock.
+// Vol moving with the stock (v15): for each option we fit, from consecutive V updates,
+//   (change in vol) = beta * (change in ln S over the same period)
+// and between V updates use vol = last V + beta * (ln S now - ln S at that V). beta is shrunk
+// towards 0 unless it is statistically clear, so with no such relationship nothing changes.
 //
 // Vol sources: an option's own last V update. If an option has never had one,
 // it borrows the vol of the nearest-strike option on the same underlying; this
@@ -101,8 +91,7 @@ class Solution : public ISolution {
         long tV;       // step of last own V
         double sigPrev; int hasPrev;   // vol before the last own V
         double lnSV; int hasLnSV;      // ln S when the last own V arrived
-        double cV;                      // common-move sum C of its stock when the last own V arrived
-        int fit;                        // index into fits (per option)
+        double rn, rxx, rxy, ryy, beta; // fit of vol change vs ln S change between V updates
         // cached price for repeat quotes
         double cPrice, cVega;
         unsigned cSV;
@@ -156,60 +145,6 @@ class Solution : public ISolution {
     double gAbs = 0, gCnt = 0;        // global |profit| scale
 
     std::vector<Pend> pend, pendNext;
-
-    // least-squares fit of vol change on up to 3 features, with exponential forgetting
-    struct Fit {
-        double n = 0, A[3][3] = {}, r[3] = {}, yy = 0, b[3] = {};
-        void add(const double f[3], double y) {
-            const double D = 0.998;
-            n = n * D + 1;
-            yy = yy * D + y * y;
-            for (int i = 0; i < 3; i++) {
-                r[i] = r[i] * D + f[i] * y;
-                for (int j = 0; j < 3; j++) A[i][j] = A[i][j] * D + f[i] * f[j];
-            }
-        }
-        void solve() {
-            b[0] = b[1] = b[2] = 0;
-            if (n < 20) return;
-            int idx[3], k = 0;
-            for (int i = 0; i < 3; i++) if (A[i][i] > 1e-18) idx[k++] = i;
-            if (k == 0) return;
-            double M[3][6] = {};
-            for (int i = 0; i < k; i++) {
-                for (int j = 0; j < k; j++) M[i][j] = A[idx[i]][idx[j]];
-                M[i][i] *= 1.0 + 1e-9;
-                M[i][k + i] = 1.0;
-            }
-            for (int c = 0; c < k; c++) {  // Gauss-Jordan inverse
-                int pv = c;
-                for (int i = c + 1; i < k; i++) if (std::fabs(M[i][c]) > std::fabs(M[pv][c])) pv = i;
-                if (std::fabs(M[pv][c]) < 1e-300) return;
-                if (pv != c) for (int j = 0; j < 2 * k; j++) std::swap(M[pv][j], M[c][j]);
-                double d = M[c][c];
-                for (int j = 0; j < 2 * k; j++) M[c][j] /= d;
-                for (int i = 0; i < k; i++) {
-                    if (i == c) continue;
-                    double f = M[i][c];
-                    if (f != 0) for (int j = 0; j < 2 * k; j++) M[i][j] -= f * M[c][j];
-                }
-            }
-            double bb[3] = {}, rss = yy;
-            for (int i = 0; i < k; i++) {
-                for (int j = 0; j < k; j++) bb[i] += M[i][k + j] * r[idx[j]];
-                rss -= bb[i] * r[idx[i]];
-            }
-            double s2 = std::max(rss, 0.0) / std::max(n - k, 1.0);
-            for (int i = 0; i < k; i++) {
-                double v = s2 * M[i][k + i];
-                double t2 = v > 0 ? bb[i] * bb[i] / v : 1e9;
-                double sh = t2 > 4.0 ? 1.0 - 4.0 / t2 : 0.0;
-                if (std::isfinite(bb[i])) b[idx[i]] = bb[i] * sh;
-            }
-        }
-    };
-    std::vector<Fit> fits, ufits;   // per option, per stock (pooled)
-    std::vector<double> commonC;    // per stock: running sum of unexplained vol moves
 
     static inline double cnd(double x, double& e) {
         double ax = std::fabs(x);
@@ -343,9 +278,6 @@ class Solution : public ISolution {
         hasSpot.assign(nU, 0);
         spotVer.assign(nU, 0u);
         uMean.assign(nU, 0.0); uMeanN.assign(nU, 0);
-        fits.assign(n, Fit{});
-        ufits.assign(nU, Fit{});
-        commonC.assign(nU, 0.0);
         tN.assign((size_t)n * NGRP * NB, 0.f);
         tS.assign((size_t)n * NGRP * NB, 0.f);
         tQ.assign((size_t)n * NGRP * NB, 0.f);
@@ -563,22 +495,13 @@ class Solution : public ISolution {
 #endif
     }
 
-    inline const double* coefOf(int p) const {
-        const Fit& f = fits[p];
-        return (f.n >= 20 || !USE_POOL) ? f.b : ufits[o[p].u].b;
-    }
-
-    // Current vol estimate: last V, moved with the stock / common level if the fit is clear.
+    // Current vol estimate: last V, moved with the stock if the fitted relationship is clear.
     inline double sigNow(const Opt& x) const {
-        if (!x.own || !x.hasLnSV || !hasSpot[x.u]) return x.sig;
-        const double* b = coefOf((int)(&x - o.data()));
-        if (b[0] == 0 && b[1] == 0 && b[2] == 0) return x.sig;
-        double x1 = lnSpot[x.u] - x.lnK, x0 = x.lnSV - x.lnK;
-        double d = b[0] * (x1 - x0) + b[1] * (x1 * x1 - x0 * x0) + b[2] * (commonC[x.u] - x.cV);
-        double lim = 0.5 * x.sig;
-        if (d > lim) d = lim;
-        if (d < -lim) d = -lim;
-        return x.sig + d;
+        if (!x.own || x.beta == 0 || !x.hasLnSV || !hasSpot[x.u]) return x.sig;
+        double d = x.beta * (lnSpot[x.u] - x.lnSV);  // change in ln(vol)
+        if (d > 0.4) d = 0.4;
+        if (d < -0.4) d = -0.4;
+        return x.sig * std::exp(d);
     }
 
     inline void quoteOption(int p, double S, double lnS, std::vector<Valuation>& out) {
@@ -623,22 +546,22 @@ class Solution : public ISolution {
             uMean[u] = uMeanN[u] == 0 ? sig : uMean[u] + 0.05 * (sig - uMean[u]); uMeanN[u]++;
         }
 #endif
-        {   // learn how this option's vol moves with its stock and with the other options' vols
+        {   // learn how this option's vol moves with its stock
             int u = x.u;
             if (x.own && x.hasLnSV && hasSpot[u] && x.sig > 0 && sig > 0) {
-                double x1 = lnSpot[u] - x.lnK, x0 = x.lnSV - x.lnK;
-                double f[3] = {x1 - x0, USE_CURV ? x1 * x1 - x0 * x0 : 0.0, USE_COMMON ? commonC[u] - x.cV : 0.0};
-                double y = sig - x.sig;
-                const double* b = coefOf(p);
-                double z = y - b[0] * f[0] - b[1] * f[1];  // vol move not explained by the stock
-                fits[p].add(f, y);
-                fits[p].solve();
-                ufits[u].add(f, y);
-                ufits[u].solve();
-                commonC[u] += z;
+                const double D = 0.998;
+                double dx = lnSpot[u] - x.lnSV, dy = std::log(sig) - std::log(x.sig);
+                x.rn = x.rn * D + 1; x.rxx = x.rxx * D + dx * dx; x.rxy = x.rxy * D + dx * dy; x.ryy = x.ryy * D + dy * dy;
+                x.beta = 0;
+                if (x.rn >= 20 && x.rxx > 0) {
+                    double b = x.rxy / x.rxx;
+                    double res = std::max(0.0, (x.ryy - b * x.rxy) / x.rn);
+                    double se2 = res / x.rxx;
+                    double t2 = se2 > 0 ? b * b / se2 : 1e9;
+                    if (t2 > 4.0) x.beta = b * (1.0 - 4.0 / t2);
+                }
             }
             if (hasSpot[u]) { x.lnSV = lnSpot[u]; x.hasLnSV = 1; } else { x.hasLnSV = 0; }
-            x.cV = commonC[u];
         }
         x.sig = sig;
         x.sst = sig * x.sqrtT;
