@@ -27,17 +27,16 @@ class Solution : public ISolution {
     static constexpr double R = 0.04;
     static constexpr int NB = 48;   // staleness buckets per vol source
     static constexpr int NSRC = 2;  // 0 = own vol, 1 = borrowed from a sibling
+    // Feedback state of an option since its last V (own vol only): how did the last quote on
+    // this vol score, relative to the option's typical gain m?
+    //   0 = no feedback yet, 1 = profit > 0.66 m, 2 = > 0.33 m, 3 = > 0, 4 = loss
+    static constexpr int NC = 5;
+    static constexpr int NG = NSRC * NC;  // situation groups: (vol source, feedback state)
     static constexpr int NQ = 112;  // pooled buckets
     static constexpr double PRIOR_W = 3.0;  // weight of pooled prior (in samples)
     static constexpr double BONUS = 0.25;   // optimism bonus, in units of option's profit scale
     static constexpr double POOL_OPT = 0.5; // optimistic normalized prior for unseen pooled buckets
     static constexpr double FADE = 0.99;    // old results fade: ~100 most recent quotes per situation count
-#ifndef P_EXTRAP
-#define P_EXTRAP 0.5
-#endif
-    // Between V updates, project the vol forward using the change between the last two V's:
-    // vol = lastV + EXTRAP * slope * (steps since lastV), limited to +-50% of lastV.
-    static constexpr double EXTRAP = P_EXTRAP;
     static constexpr double ZCUT = 2.0;     // only stop quoting a situation if it is losing by > 2 standard errors
     // A cut situation is still sampled now and then so the gate keeps learning about it:
     // every 4th chance if it is near break-even, every 16th if clearly negative, every 64th if very negative.
@@ -54,7 +53,7 @@ class Solution : public ISolution {
         // own vol (precomputed pricing terms)
         double sig, a, inv, sst;
         long tV;       // step of last own V
-        double slope;  // vol change per step between the last two V's
+        int cls;       // feedback state since last V (see NC)
         int own;       // 1 if own vol is known
         int sib;       // index of sibling to borrow vol from (-1 = none)
         // profit scale
@@ -84,7 +83,7 @@ class Solution : public ISolution {
     // learning tables
     std::vector<float> tN, tS, tQ;    // per option: [opt][src][bucket] count, sum, sum of squares
     std::vector<unsigned> tC;         // per situation: chances skipped since it was cut
-    double pN[NSRC][NQ] = {}, pS[NSRC][NQ] = {};  // pooled, normalized profits
+    double pN[NG][NQ] = {}, pS[NG][NQ] = {};  // pooled, normalized profits
     double gAbs = 0, gCnt = 0;        // global |profit| scale
 
     std::vector<Pend> pend, pendNext;
@@ -217,10 +216,10 @@ class Solution : public ISolution {
         spot.assign(nU, 0);
         lnSpot.assign(nU, 0);
         hasSpot.assign(nU, 0);
-        tN.assign((size_t)n * NSRC * NB, 0.f);
-        tS.assign((size_t)n * NSRC * NB, 0.f);
-        tQ.assign((size_t)n * NSRC * NB, 0.f);
-        tC.assign((size_t)n * NSRC * NB, 0u);
+        tN.assign((size_t)n * NG * NB, 0.f);
+        tS.assign((size_t)n * NG * NB, 0.f);
+        tQ.assign((size_t)n * NG * NB, 0.f);
+        tC.assign((size_t)n * NG * NB, 0u);
         pend.reserve(n + 8);
         pendNext.reserve(n + 8);
         regs.clear();
@@ -245,9 +244,13 @@ class Solution : public ISolution {
             tN[p.slot] = tN[p.slot] * (float)FADE + 1.f;
             tS[p.slot] = tS[p.slot] * (float)FADE + (float)pr;
             tQ[p.slot] = tQ[p.slot] * (float)FADE + (float)(pr * pr);
-            int src = p.slot / NB % NSRC;
-            pN[src][p.qslot] = pN[src][p.qslot] * FADE + 1;
-            pS[src][p.qslot] = pS[src][p.qslot] * FADE + pr / p.scale;
+            int g = p.slot / NB % NG;
+            pN[g][p.qslot] = pN[g][p.qslot] * FADE + 1;
+            pS[g][p.qslot] = pS[g][p.qslot] * FADE + pr / p.scale;
+            if (g < NC) {  // own-vol quote: update this option's feedback state
+                double r = pr / p.scale;
+                x.cls = r > 0.66 ? 1 : (r > 0.33 ? 2 : (r > 0 ? 3 : 4));
+            }
         }
     }
 
@@ -280,9 +283,10 @@ class Solution : public ISolution {
         long s = step - tV;
         int b = sBucket(s);
         int q = qBucket(s, vega);
-        size_t slot = ((size_t)p * NSRC + src) * NB + b;
+        int g = src * NC + (src == 0 ? x.cls : 0);
+        size_t slot = ((size_t)p * NG + g) * NB + b;
         double m = scaleOf(x);
-        double pm = (pS[src][q] + 2.0 * POOL_OPT) / (pN[src][q] + 2.0);
+        double pm = (pS[g][q] + 2.0 * POOL_OPT) / (pN[g][q] + 2.0);
         double n = tN[slot];
         double est = (tS[slot] + PRIOR_W * pm * m) / (n + PRIOR_W);
         // spread of profits in this situation (prior spread = profit scale m)
@@ -301,16 +305,7 @@ class Solution : public ISolution {
     inline void quoteOption(int p, double S, double lnS, std::vector<Valuation>& out) {
         const Opt& x = o[p];
         if (x.own) {
-            long dt = step - x.tV;
-            if (EXTRAP != 0 && x.slope != 0 && dt > 0 && x.sig > 0 && x.T > 0) {
-                double sig = x.sig + EXTRAP * x.slope * (double)dt;
-                sig = std::min(std::max(sig, 0.5 * x.sig), 1.5 * x.sig);
-                double sst = sig * x.sqrtT;
-                double a = (R + 0.5 * sig * sig) * x.T - x.lnK;
-                consider(p, 0, x.tV, sig, a, 1.0 / sst, sst, S, lnS, out);
-            } else {
-                consider(p, 0, x.tV, x.sig, x.a, x.inv, x.sst, S, lnS, out);
-            }
+            consider(p, 0, x.tV, x.sig, x.a, x.inv, x.sst, S, lnS, out);
         } else if (x.sib >= 0) {
             const Opt& y = o[x.sib];
             double sig = y.sig;
@@ -323,12 +318,12 @@ class Solution : public ISolution {
 
     void setVol(int p, double sig) {
         Opt& x = o[p];
-        x.slope = (x.own && x.sig > 0 && sig > 0 && step > x.tV) ? (sig - x.sig) / (double)(step - x.tV) : 0.0;
         x.sig = sig;
         x.sst = sig * x.sqrtT;
         x.inv = x.sst > 0 ? 1.0 / x.sst : 0;
         x.a = (R + 0.5 * sig * sig) * x.T - x.lnK;
         x.tV = step;
+        x.cls = 0;
         bool wasOwn = x.own;
         x.own = 1;
         if (!wasOwn) {
