@@ -1,4 +1,7 @@
 #include "api.hpp"
+// v27 = v26a + after a WEAK profit (0 < profit < 0.33 x typical gain) on the current vol, each option
+// learns whether its following quotes lose; only if they do on average, 7 in 8 of them are skipped.
+// v26a = v25 + repeat quotes also learn their post-loss skip per option (own statistics).
 // v25 = v21 + after a loss on an option's current vol, skip most of its update-quotes until the next V;
 // how many is learned per option from the quotes still sent after a loss (earning -> 3 in 4, losing -> 31 in 32).
 
@@ -131,6 +134,9 @@ class Solution : public ISolution {
         int invOn; unsigned period; int lossRun;         // inversion used in this V period?
         double sOn, nOn, sOff, nOff;                     // stale-quote profit (normalized) with / without
         double plS, plN;                                 // profit (normalized) of update-quotes sent after a loss
+        double rpS, rpN;                                 // same for repeat quotes sent after a loss
+        double wkS, wkN, wrS, wrN;                       // same after a weak profit: update quotes / repeats
+        unsigned weakSkip;
         // cached price for repeat quotes
         double cPrice, cVega;
         unsigned cSV;
@@ -420,7 +426,10 @@ class Solution : public ISolution {
             if (src >= 2) {
                 eS = eS * 0.9995 + z; eS2 = eS2 * 0.9995 + z * z; eN = eN * 0.9995 + 1.0;
             }
-            if (p.pl) { x.plS = 0.98 * x.plS + z; x.plN = 0.98 * x.plN + 1; }
+            if (p.pl == 1) { x.plS = 0.98 * x.plS + z; x.plN = 0.98 * x.plN + 1; }
+            else if (p.pl == 2) { x.rpS = 0.98 * x.rpS + z; x.rpN = 0.98 * x.rpN + 1; }
+            else if (p.pl == 3) { x.wkS = 0.98 * x.wkS + z; x.wkN = 0.98 * x.wkN + 1; }
+            else if (p.pl == 4) { x.wrS = 0.98 * x.wrS + z; x.wrN = 0.98 * x.wrN + 1; }
             if (USE_INV && p.kind != 0) invLearn(x, p, pr);
         }
     }
@@ -512,6 +521,10 @@ class Solution : public ISolution {
             unsigned k = x.plN < 5 ? 8u : (x.plS > 0 ? 4u : 32u);
             if ((++o[p].lossSkip % k) != 0) return;
             postLoss = 1;
+        } else if (src == 0 && step != tV && x.cls == 3) {
+            unsigned k = (x.wkN < 10 || x.wkS > 0) ? 1u : 8u;
+            if (k > 1 && (++o[p].weakSkip % k) != 0) return;
+            postLoss = 3;
         }
 
         long s = step - tV;
@@ -614,8 +627,18 @@ class Solution : public ISolution {
         }
         double price = x.cPrice;
         if (!std::isfinite(price)) return;
-        // last own-vol quote on this vol lost: the vol has drifted, so do not repeat (sample 1 in 16)
-        if (USE_SKIP && src == 0 && x.cls == 4 && (++x.lossSkip & 15) != 0) return;
+        // last own-vol quote on this vol lost: skip most repeats until the next V; how many is learned
+        // per option from the repeats still sent in that state (earning -> 3 in 4, losing -> 63 in 64)
+        int postLoss = 0;
+        if (USE_SKIP && src == 0 && x.cls == 4) {
+            unsigned k = x.rpN < 5 ? 16u : (x.rpS > 0 ? 4u : 64u);
+            if ((++x.lossSkip % k) != 0) return;
+            postLoss = 1;
+        } else if (USE_SKIP && src == 0 && x.cls == 3) {
+            unsigned k = (x.wrN < 10 || x.wrS > 0) ? 1u : 8u;
+            if (k > 1 && (++x.weakSkip % k) != 0) return;
+            postLoss = 4;
+        }
         long s = step - tV;
         int q = qBucket(s, x.cVega);
         int es = src + 2;
@@ -631,6 +654,7 @@ class Solution : public ISolution {
         }
         double m = scaleOf(x);
         Pend pd{x.id, p, -1, q, m, es, g};
+        pd.pl = postLoss == 1 ? 2 : postLoss;
         if (USE_INV && src == 0) {
             pd.kind = step == tV ? 1 : 3;
             pd.sq = sig; pd.vq = x.cVega; pd.lnq = lnSpot[u]; pd.tvq = tV; pd.inv = x.invOn;
